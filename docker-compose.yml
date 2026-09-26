@@ -1,0 +1,21 @@
+services:
+  traceability-api:
+    build: .
+    image: metrological-traceability-api:latest
+    container_name: traceability-api
+    ports:
+      - "8000:8000"
+    environment:
+      TRACE_DB_PATH: /data/traceability.db
+      SEED_DEMO: "1"          # 首次启动且库为空时写入演示数据；置 0 可关闭
+    volumes:
+      - trace-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  trace-data:
