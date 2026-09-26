@@ -22,6 +22,12 @@
      ``undetermined``（结果未定）——保留样本链与截断说明，但不提供有效
      主链，绝不把样本误判为唯一或断裂。共同溯源、测量相容性与预约链路
      门禁以专用原因码 ``RESULT_UNDETERMINED`` 拒绝未定结果。
+
+  6. **快照索引**：:class:`Catalog` 在装载（数据库或派生证书停用视图）时
+     一次性建立按仪器分组的证书索引、按边 ID 定位的索引与父子边索引；
+     链路枚举、历史区间断档与链级校验全部复用这些索引，不再每条候选链
+     重建全边映射、每台相关仪器重复扫描全库证书。索引只属于当前快照，
+     停用模拟派生新 Catalog 时随构造重建，不污染原快照。
 """
 from __future__ import annotations
 
@@ -42,10 +48,27 @@ _TS_PARSE_FMT = "%Y-%m-%dT%H:%M:%SZ"
 # ---------------------------------------------------------------- 数据装载
 
 class Catalog:
-    """证书/仪器/边的内存快照。
+    """证书/仪器/边的内存快照及其派生索引。
 
     常规评估直接从连接装载；证书停用模拟则在内存中构造一个“移除证书与
     关联边”后的派生 Catalog，全程不执行任何写库操作。
+
+    装载（或派生）时一次性建立三类索引，供链路枚举、历史区间断档检查与
+    链级校验复用，避免每条候选链重建全边映射、每台相关仪器重复扫描全库
+    证书：
+
+    * ``certs_by_instrument`` —— 按仪器分组的证书索引：仪器编码 -> 该仪器
+      全部证书，按 ``(valid_from, valid_until)`` 预排序（与历史区间断档
+      扫描的排序键一致；稳定排序，并列时保持装载次序）；
+    * ``edges_by_id`` —— 按边 ID 定位的索引：边 id -> 边；
+    * ``out_edges`` —— 父子边索引：子证书 id -> 该证书的全部向上溯源边。
+
+    另预取 ``root_cert_ids``（国家基准证书 id，保持证书装载次序），供
+    基准节点巡检直接遍历，不再每次评估全表扫描证书。
+
+    索引只属于当前快照：派生视图（如停用模拟）在自己的构造过程中重建
+    索引，绝不回写或污染原快照；每个请求各自装载新 Catalog，后续请求
+    因此总是读取最新数据。
     """
 
     def __init__(
@@ -69,9 +92,35 @@ class Catalog:
         self.instruments: dict[str, Any] = instruments or {}
         self.certs: dict[str, Any] = certs or {}
         self.edges: list[Any] = edges or []
+        self._build_indexes()
+
+    def _build_indexes(self) -> None:
+        """基于当前快照内容建立全部派生索引（每个快照仅构造时建一次）。"""
+        # 按仪器分组的证书索引（预排序，供历史区间断档扫描与起点选取）
+        self.certs_by_instrument: dict[str, list[Any]] = {}
+        for c in self.certs.values():
+            self.certs_by_instrument.setdefault(c["instrument_code"], []).append(c)
+        for group in self.certs_by_instrument.values():
+            group.sort(key=lambda c: (c["valid_from"], c["valid_until"]))
+        # 按边 ID 定位的索引（链级校验与链序列化按 id 直接取边）
+        self.edges_by_id: dict[Any, Any] = {e["id"]: e for e in self.edges}
+        # 父子边索引：子证书 -> 全部向上溯源边（链路枚举的邻接表）
         self.out_edges: dict[str, list[Any]] = {}
         for e in self.edges:
             self.out_edges.setdefault(e["child_cert_id"], []).append(e)
+        # 国家基准证书 id（保持证书装载次序，基准巡检不再全表扫描）
+        self.root_cert_ids: list[str] = [
+            cid
+            for cid, c in self.certs.items()
+            if self.instruments[c["instrument_code"]]["is_national_standard"]
+        ]
+
+    def certs_of(self, instrument_code: str) -> list[Any]:
+        """该仪器的全部证书（按有效期预排序）。
+
+        返回快照内共享的只读列表，调用方不得修改；未知仪器返回空列表。
+        """
+        return self.certs_by_instrument.get(instrument_code, [])
 
 
 # ---------------------------------------------------------------- 冲突
@@ -309,7 +358,7 @@ def _check_chain(cat: Catalog, path: dict[str, Any]):
     """父子相邻关系检查：区间覆盖、不确定度收缩、边覆盖校准时刻。"""
     issues: list[dict[str, Any]] = []
     cert_ids = path["cert_ids"]
-    edges_by_id = {e["id"]: e for e in cat.edges}
+    edges_by_id = cat.edges_by_id  # 复用快照索引，不再逐链重建全边映射
 
     for i in range(len(cert_ids) - 1):
         child = cat.certs[cert_ids[i]]
@@ -413,12 +462,12 @@ def _check_history_gaps(cat: Catalog, instrument_code: str):
     内部互不相接）只是并集内部的冗余，不得制造假空隙。断档证据中的
     前证书取“把并集推进到缺口边界的证书”，保证 ``gap_from`` 是并集
     真实覆盖终点，而非排序后恰好相邻的某张短证书的截止时刻。
+
+    证书序列直接取快照的按仪器分组索引（已按 ``(valid_from,
+    valid_until)`` 预排序），不再每次评估全表扫描并重排。
     """
     issues: list[dict[str, Any]] = []
-    certs = sorted(
-        [c for c in cat.certs.values() if c["instrument_code"] == instrument_code],
-        key=lambda c: (c["valid_from"], c["valid_until"]),
-    )
+    certs = cat.certs_of(instrument_code)
     if not certs:
         return issues
     covered_until = certs[0]["valid_until"]
@@ -451,7 +500,7 @@ def _check_history_gaps(cat: Catalog, instrument_code: str):
 # ---------------------------------------------------------------- 序列化
 
 def _serialize_chain(cat: Catalog, path: dict[str, Any]) -> dict[str, Any]:
-    edges_by_id = {e["id"]: e for e in cat.edges}
+    edges_by_id = cat.edges_by_id  # 复用快照索引，不再逐链重建全边映射
     nodes = []
     for cid in path["cert_ids"]:
         c = cat.certs[cid]
@@ -511,11 +560,11 @@ def build_report(
 
 
 def _active_starts(cat: Catalog, instrument_code: str, at_s: str) -> list[str]:
+    # 按仪器分组索引取该仪器证书，不再全表扫描
     return sorted(
         c["id"]
-        for c in cat.certs.values()
-        if c["instrument_code"] == instrument_code
-        and c["valid_from"] <= at_s <= c["valid_until"]
+        for c in cat.certs_of(instrument_code)
+        if c["valid_from"] <= at_s <= c["valid_until"]
     )
 
 
@@ -574,11 +623,9 @@ def _build_report(
                 seen_nodes.add(cid)
                 node_issues[cid] = _check_node(cat, cid, at_s)
 
-    # 国家基准证书不应再拥有有效向上溯源边
-    for cid, cert in cat.certs.items():
-        inst = cat.instruments[cert["instrument_code"]]
-        if not inst["is_national_standard"]:
-            continue
+    # 国家基准证书不应再拥有有效向上溯源边（遍历快照预取的基准证书
+    # 索引，保持证书装载次序，不再每次评估全表扫描证书）
+    for cid in cat.root_cert_ids:
         for e in cat.out_edges.get(cid, []):
             if e["valid_from"] <= at_s <= e["valid_until"]:
                 global_issues.append(
@@ -1572,7 +1619,11 @@ def build_measurement_compatibility_report(
 def _catalog_without_certificates(
     cat: Catalog, disabled_ids: set[str]
 ) -> Catalog:
-    """在内存中模拟移除指定证书及其全部关联溯源边，不写入数据库。"""
+    """在内存中模拟移除指定证书及其全部关联溯源边，不写入数据库。
+
+    返回的派生 Catalog 在构造时基于留存内容重建全部索引（按仪器分组、
+    按边 ID、父子边）；原快照及其索引保持原样，不受模拟污染。
+    """
     kept_certs = {
         cid: c for cid, c in cat.certs.items() if cid not in disabled_ids
     }
@@ -1921,11 +1972,8 @@ def _collect_relevant_boundaries(
     区间有效性按闭区间判定，因此边界点本身单独评估，不并入开区间。
     """
     relevant_certs: set[str] = set()
-    stack = [
-        cid
-        for cid, c in cat.certs.items()
-        if c["instrument_code"] == instrument_code
-    ]
+    # 起点集合取按仪器分组的证书索引，不再全表扫描
+    stack = [c["id"] for c in cat.certs_of(instrument_code)]
     while stack:
         cid = stack.pop()
         if cid in relevant_certs or cid not in cat.certs:

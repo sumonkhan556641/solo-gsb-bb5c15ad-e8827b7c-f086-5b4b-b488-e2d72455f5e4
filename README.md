@@ -76,7 +76,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（218 个用例）
+pytest -q        # 运行测试（228 个用例）
 ```
 
 本地服务监听 **http://localhost:8000**（与 Docker Compose 映射端口一致）：
@@ -1615,6 +1615,22 @@ curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
 
 ## 七、溯源算法说明
 
+**快照与索引。** 每次评估先把仪器/证书/溯源边装载为内存快照
+（`engine.Catalog`；证书停用评估则在内存中派生“移除证书与关联边”的
+新快照，不写库）。装载（或派生）时一次性建立三类索引：
+
+- **按仪器分组的证书索引**（`certs_by_instrument`，按
+  `(valid_from, valid_until)` 预排序）——起点选取与历史区间断档扫描
+  只访问相关仪器的分组，不再每台仪器重复扫描全库证书；
+- **按边 ID 定位的索引**（`edges_by_id`）——链级校验与链序列化按边 id
+  直接取边，不再每条候选链重建全边映射；
+- **父子边索引**（`out_edges`，子证书 → 全部向上溯源边）——链路枚举的
+  邻接表；另预取国家基准证书列表供基准巡检直接遍历。
+
+索引只属于当前快照：派生视图在自己的构造中重建索引，不污染原快照；
+每个请求各自装载新 Catalog，后续请求总是读取最新数据。下列步骤 1~5
+均在同一快照上复用这些索引，扫描量随快照规模增长而非候选链数。
+
 1. 取目标仪器在 `at` 生效（`valid_from <= at <= valid_until`）的证书作为起点；
 2. 自起点沿在 `at` 有效的边做 DFS 枚举（同父子证书的并行边合并；检测环；500 条上限保护——达到上限且仍有未展开分支时置 `paths_truncated=true`）；
 3. 终止条件：到达国家基准仪器证书（成链）、无有效边（死路）、父证书失效（断档）、成环；
@@ -1719,7 +1735,11 @@ app/
   database.py        SQLite 连接、表结构
   schemas.py         Pydantic 请求/响应模型
   crud.py            upsert 与写入期校验、证书修订历史（连续版本快照）
-  engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）、
+  engine.py          溯源链重建（DFS）、校验规则、内存快照 Catalog
+                     （装载/派生时一次性建立按仪器分组的证书索引、
+                     按边 ID 定位的索引与父子边索引，链路枚举、历史
+                     断档与链级校验复用，索引不跨快照共享）、
+                     停用影响模拟（派生 Catalog，不写库）、
                      仪器时间窗覆盖分段（边界点 + 开区间内部采样）、
                      批次共同溯源核查（共同证书选举 + 子链截取）、
                      测量相容性评估（En 数 + 极大团分组）、
@@ -1751,6 +1771,10 @@ app/
                      撤销 DELETE）/
                      export / admin
 tests/test_trace.py          12 个接口级测试
+tests/test_catalog_indexes.py 10 个 Catalog 派生索引测试（索引结构、
+                             停用派生视图索引隔离、后续装载读新数据、
+                             多分支长链结果等价、扫描量随快照而非候选
+                             链数增长）
 tests/test_undetermined.py   10 个枚举截断“结果未定”测试（undetermined 语义、
                              样本链保留、已见两条合格链仍判多候选、
                              空档/确认/巡检/补位/共同溯源/相容性门禁以
