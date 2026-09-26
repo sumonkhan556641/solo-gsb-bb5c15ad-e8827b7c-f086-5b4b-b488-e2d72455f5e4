@@ -46,6 +46,22 @@ class Catalog:
 
     常规评估直接从连接装载；证书停用模拟则在内存中构造一个“移除证书与
     关联边”后的派生 Catalog，全程不执行任何写库操作。
+
+    装载（或派生）时一次性建立三类索引，链路枚举、历史区间断档与链级
+    校验等全部评估直接复用，不再按候选链/相关仪器重复全库扫描：
+
+    * ``certs_by_instrument`` —— 按仪器分组的证书索引（保持装载顺序）：
+      起点筛选与历史区间断档检查按仪器直接取证书子集，不再每台相关
+      仪器重复扫描全库证书；
+    * ``edges_by_id`` —— 按边 ID 定位的索引：链级校验与链序列化按
+      边 id 直接定位，不再每条候选链重建全边映射；
+    * ``out_edges`` —— 父子边索引（子证书 id -> 其全部向上溯源边，
+      保持装载顺序）：链路枚举沿它自子向父遍历。
+
+    索引仅属于本快照：派生快照（证书停用模拟）基于自己的证书/边集合
+    在构造时重建索引，不回写、不与原快照共享可变状态，原快照的索引与
+    数据不受污染；每个请求各自从连接装载新快照，后续请求始终读到
+    最新数据。
     """
 
     def __init__(
@@ -69,9 +85,23 @@ class Catalog:
         self.instruments: dict[str, Any] = instruments or {}
         self.certs: dict[str, Any] = certs or {}
         self.edges: list[Any] = edges or []
+        # ---- 快照索引（仅属于本 Catalog；派生快照各自重建）----
+        # 按仪器分组的证书索引
+        self.certs_by_instrument: dict[str, list[Any]] = {}
+        for c in self.certs.values():
+            self.certs_by_instrument.setdefault(
+                c["instrument_code"], []
+            ).append(c)
+        # 按边 ID 定位的索引 + 父子边索引（同一趟扫描建立）
+        self.edges_by_id: dict[Any, Any] = {}
         self.out_edges: dict[str, list[Any]] = {}
         for e in self.edges:
+            self.edges_by_id[e["id"]] = e
             self.out_edges.setdefault(e["child_cert_id"], []).append(e)
+
+    def certs_of(self, instrument_code: str) -> list[Any]:
+        """该仪器的全部证书（按仪器分组的证书索引，保持装载顺序）。"""
+        return self.certs_by_instrument.get(instrument_code, [])
 
 
 # ---------------------------------------------------------------- 冲突
@@ -309,7 +339,8 @@ def _check_chain(cat: Catalog, path: dict[str, Any]):
     """父子相邻关系检查：区间覆盖、不确定度收缩、边覆盖校准时刻。"""
     issues: list[dict[str, Any]] = []
     cert_ids = path["cert_ids"]
-    edges_by_id = {e["id"]: e for e in cat.edges}
+    # 复用快照级“按边 ID 定位”索引，不再每条候选链重建全边映射
+    edges_by_id = cat.edges_by_id
 
     for i in range(len(cert_ids) - 1):
         child = cat.certs[cert_ids[i]]
@@ -413,10 +444,13 @@ def _check_history_gaps(cat: Catalog, instrument_code: str):
     内部互不相接）只是并集内部的冗余，不得制造假空隙。断档证据中的
     前证书取“把并集推进到缺口边界的证书”，保证 ``gap_from`` 是并集
     真实覆盖终点，而非排序后恰好相邻的某张短证书的截止时刻。
+
+    证书取自快照的“按仪器分组”索引，不再每台相关仪器重复扫描全库
+    证书；排序键与扫描顺序不变，结果与全量过滤后排序完全一致。
     """
     issues: list[dict[str, Any]] = []
     certs = sorted(
-        [c for c in cat.certs.values() if c["instrument_code"] == instrument_code],
+        cat.certs_of(instrument_code),
         key=lambda c: (c["valid_from"], c["valid_until"]),
     )
     if not certs:
@@ -451,7 +485,8 @@ def _check_history_gaps(cat: Catalog, instrument_code: str):
 # ---------------------------------------------------------------- 序列化
 
 def _serialize_chain(cat: Catalog, path: dict[str, Any]) -> dict[str, Any]:
-    edges_by_id = {e["id"]: e for e in cat.edges}
+    # 复用快照级“按边 ID 定位”索引，不再每条候选链重建全边映射
+    edges_by_id = cat.edges_by_id
     nodes = []
     for cid in path["cert_ids"]:
         c = cat.certs[cid]
@@ -511,11 +546,11 @@ def build_report(
 
 
 def _active_starts(cat: Catalog, instrument_code: str, at_s: str) -> list[str]:
+    # 按仪器分组的证书索引直接取该仪器证书，不再每次扫描全库证书
     return sorted(
         c["id"]
-        for c in cat.certs.values()
-        if c["instrument_code"] == instrument_code
-        and c["valid_from"] <= at_s <= c["valid_until"]
+        for c in cat.certs_of(instrument_code)
+        if c["valid_from"] <= at_s <= c["valid_until"]
     )
 
 
@@ -1572,7 +1607,12 @@ def build_measurement_compatibility_report(
 def _catalog_without_certificates(
     cat: Catalog, disabled_ids: set[str]
 ) -> Catalog:
-    """在内存中模拟移除指定证书及其全部关联溯源边，不写入数据库。"""
+    """在内存中模拟移除指定证书及其全部关联溯源边，不写入数据库。
+
+    返回的派生 Catalog 在构造时基于自己的证书/边集合重建全部快照索引
+    （按仪器分组的证书索引、按边 ID 定位的索引、父子边索引）；原快照
+    ``cat`` 的数据与索引均不被触碰，停用模拟不会污染原快照。
+    """
     kept_certs = {
         cid: c for cid, c in cat.certs.items() if cid not in disabled_ids
     }
@@ -1919,13 +1959,10 @@ def _collect_relevant_boundaries(
     （国家基准证书一并纳入，保证根节点检查一致）；各证书/边的
     valid_from / valid_until 落在闭查询窗内的即为边界。
     区间有效性按闭区间判定，因此边界点本身单独评估，不并入开区间。
+    该仪器的证书取自快照的“按仪器分组”索引，不重复扫描全库证书。
     """
     relevant_certs: set[str] = set()
-    stack = [
-        cid
-        for cid, c in cat.certs.items()
-        if c["instrument_code"] == instrument_code
-    ]
+    stack = [c["id"] for c in cat.certs_of(instrument_code)]
     while stack:
         cid = stack.pop()
         if cid in relevant_certs or cid not in cat.certs:

@@ -76,7 +76,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（218 个用例）
+pytest -q        # 运行测试（225 个用例）
 ```
 
 本地服务监听 **http://localhost:8000**（与 Docker Compose 映射端口一致）：
@@ -1615,6 +1615,14 @@ curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
 
 ## 七、溯源算法说明
 
+0. **Catalog 快照索引**：每次评估先装载 `Catalog` 内存快照（证书停用模拟则
+   派生一个“移除证书与关联边”的快照），装载时一次性建立三类索引——
+   **按仪器分组的证书索引**、**按边 ID 定位的索引**、**父子边索引**
+   （子证书 → 其全部向上溯源边）。后续链路枚举、历史区间断档检查与链级
+   校验全部复用这些索引：不再每条候选链重建全边映射，也不再每台相关
+   仪器重复扫描全库证书，全表扫描次数只随快照数量增长。索引仅属于当前
+   快照——派生快照基于自身数据重建索引、不污染原快照；每个请求各自
+   重新装载，后续请求始终读到最新数据。
 1. 取目标仪器在 `at` 生效（`valid_from <= at <= valid_until`）的证书作为起点；
 2. 自起点沿在 `at` 有效的边做 DFS 枚举（同父子证书的并行边合并；检测环；500 条上限保护——达到上限且仍有未展开分支时置 `paths_truncated=true`）；
 3. 终止条件：到达国家基准仪器证书（成链）、无有效边（死路）、父证书失效（断档）、成环；
@@ -1719,7 +1727,9 @@ app/
   database.py        SQLite 连接、表结构
   schemas.py         Pydantic 请求/响应模型
   crud.py            upsert 与写入期校验、证书修订历史（连续版本快照）
-  engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）、
+  engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）；
+                     Catalog 快照索引（按仪器分组的证书索引、按边 ID 定位的
+                     索引、父子边索引，装载/派生时一次性建立，评估全程复用）、
                      仪器时间窗覆盖分段（边界点 + 开区间内部采样）、
                      批次共同溯源核查（共同证书选举 + 子链截取）、
                      测量相容性评估（En 数 + 极大团分组）、
@@ -1751,6 +1761,10 @@ app/
                      撤销 DELETE）/
                      export / admin
 tests/test_trace.py          12 个接口级测试
+tests/test_catalog_indexes.py 7 个 Catalog 快照索引测试（索引建立与派生隔离、
+                             多分支长链与多仪器结果等价、全表扫描次数随快照
+                             而非候选链数增长、500 条截断未定语义保持、
+                             后续请求读取新数据）
 tests/test_undetermined.py   10 个枚举截断“结果未定”测试（undetermined 语义、
                              样本链保留、已见两条合格链仍判多候选、
                              空档/确认/巡检/补位/共同溯源/相容性门禁以
